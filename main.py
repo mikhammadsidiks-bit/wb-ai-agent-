@@ -37,6 +37,62 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def wb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
+        return await update.effective_message.reply_text(
+            "Доступ запрещён."
+        )
+
+    msg = await update.effective_message.reply_text(
+        "Загружаю реальные товары из WB..."
+    )
+
+    if not WB_TOKEN:
+        return await msg.edit_text("WB_API_TOKEN не задан в Render.")
+
+    url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
+    headers = {"Authorization": WB_TOKEN}
+    payload = {
+        "settings": {
+            "cursor": {"limit": 5},
+            "filter": {"withPhoto": -1}
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                url, headers=headers, json=payload
+            )
+
+        if r.status_code != 200:
+            return await msg.edit_text(
+                f"Ошибка WB API: HTTP {r.status_code}"
+            )
+
+        data = r.json()
+        cards = data.get("cards", [])
+
+        if not cards:
+            return await msg.edit_text(
+                "WB API ответил успешно, но товары не получены."
+            )
+
+        lines = ["Реальные товары из твоего кабинета WB:\n"]
+
+        for i, card in enumerate(cards, 1):
+            lines.append(
+                f"{i}. {card.get('title', 'Без названия')}\n"
+                f"Артикул продавца: {card.get('vendorCode', '—')}\n"
+                f"Артикул WB: {card.get('nmID', '—')}\n"
+                f"Бренд: {card.get('brand', '—')}"
+            )
+
+        await msg.edit_text("\n\n".join(lines))
+
+    except Exception:
+        logging.exception("Ошибка получения товаров WB")
+        await msg.edit_text(
+            "Не удалось получить товары. Проверь логи Render."
+        )
         return await update.effective_message.reply_text("Доступ запрещён.")
     msg = await update.effective_message.reply_text("Проверяю WB API...")
     if not WB_TOKEN:
