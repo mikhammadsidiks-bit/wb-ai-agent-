@@ -30,5 +30,5 @@ jobs:
         working-directory: auto_reply
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-          REVIEW_LOOKBACK_DAYS: "1"
+          REVIEW_LOOKBACK_DAYS: "30"
         run: python main.py
