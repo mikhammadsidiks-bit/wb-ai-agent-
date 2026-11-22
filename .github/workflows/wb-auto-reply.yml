@@ -15,7 +15,7 @@ concurrency:
 jobs:
   auto-reply:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,9 +26,12 @@ jobs:
       - name: Install dependencies
         working-directory: auto_reply
         run: pip install -r requirements.txt
-      - name: Reply to unanswered reviews
+      - name: Reply to unanswered reviews in all connected stores
         working-directory: auto_reply
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+          WB_STORE_NAME: "Магазин 1"
+          WB_API_TOKEN_2: ${{ secrets.WB_API_TOKEN_2 }}
+          WB_STORE_NAME_2: "Магазин 2"
           REVIEW_LOOKBACK_DAYS: "100"
         run: python main.py
