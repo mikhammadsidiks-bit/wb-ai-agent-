@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -41,20 +42,40 @@ def request_with_retry(session, method, url, *, max_attempts=5, **kwargs):
     raise RuntimeError("Request retry loop ended unexpectedly")
 
 
-def run():
-    token = os.environ.get("WB_API_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("Add WB_API_TOKEN in GitHub Actions repository secrets.")
+def configured_stores():
+    """Read store tokens from Actions secrets exposed as environment variables."""
+    stores = []
+    primary = os.environ.get("WB_API_TOKEN", "").strip()
+    if primary:
+        stores.append((os.getenv("WB_STORE_NAME", "Магазин 1"), primary))
 
-    # On every run, check recent unanswered reviews. The window is configurable.
-    lookback_days = int(os.getenv("REVIEW_LOOKBACK_DAYS", "30"))
-    if not 1 <= lookback_days <= 365:
-        raise RuntimeError("REVIEW_LOOKBACK_DAYS must be between 1 and 365.")
-    date_from = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+    numbered = []
+    for key, value in os.environ.items():
+        match = re.fullmatch(r"WB_API_TOKEN_(\d+)", key)
+        if match and value.strip():
+            numbered.append((int(match.group(1)), key, value.strip()))
 
+    for number, key, token in sorted(numbered):
+        name = os.getenv(f"WB_STORE_NAME_{number}", f"Магазин {number}")
+        stores.append((name, token))
+
+    if not stores:
+        raise RuntimeError(
+            "Add WB_API_TOKEN (and optionally WB_API_TOKEN_2, "
+            "WB_API_TOKEN_3, ...) in GitHub Actions repository secrets."
+        )
+    return stores
+
+
+def run_store(store_name, token, lookback_days):
+    date_from = int(
+        (datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp()
+    )
     headers = {"Authorization": token, "Accept": "application/json"}
     session = requests.Session()
     sent = 0
+
+    log.info("[%s] Checking unanswered reviews.", store_name)
 
     # Successful replies disappear from the unanswered list, so keep reading
     # from skip=0 until no unanswered reviews remain on the first page.
@@ -72,8 +93,9 @@ def run():
         )
         if response.status_code != 200:
             raise RuntimeError(
-                f"WB review-list request failed: HTTP {response.status_code}. "
-                "Check token permissions and WB API availability."
+                f"[{store_name}] WB review-list request failed: "
+                f"HTTP {response.status_code}. Check token permissions "
+                "and WB API availability."
             )
 
         payload = response.json()
@@ -86,7 +108,7 @@ def run():
             feedback_id = feedback.get("id")
             rating = feedback.get("productValuation")
             if not feedback_id or not isinstance(rating, int) or not 1 <= rating <= 5:
-                log.warning("Skipped a review with missing ID or invalid rating.")
+                log.warning("[%s] Skipped a review with missing ID or invalid rating.", store_name)
                 continue
 
             answer_text = POSITIVE if rating >= 4 else NEGATIVE
@@ -99,23 +121,49 @@ def run():
             )
             if result.status_code != 204:
                 raise RuntimeError(
-                    f"WB reply request failed: HTTP {result.status_code}. "
-                    "Check token write permissions and WB API availability."
+                    f"[{store_name}] WB reply request failed: "
+                    f"HTTP {result.status_code}. Check token write permissions "
+                    "and WB API availability."
                 )
 
             sent += 1
             batch_sent += 1
-            log.info("Successfully replied to a review (%s stars).", rating)
+            log.info("[%s] Successfully replied to a review (%s stars).", store_name, rating)
             time.sleep(0.4)  # Stay below the personal-token request limit.
 
         if batch_sent == 0:
             log.warning(
-                "No replies were sent from the current page; stopping to avoid "
-                "reprocessing the same unanswered reviews."
+                "[%s] No replies were sent from the current page; stopping "
+                "to avoid reprocessing the same unanswered reviews.",
+                store_name,
             )
             break
 
-    log.info("Run finished. Replies sent: %d", sent)
+    log.info("[%s] Run finished. Replies sent: %d", store_name, sent)
+    return sent
+
+
+def run():
+    lookback_days = int(os.getenv("REVIEW_LOOKBACK_DAYS", "100"))
+    if not 1 <= lookback_days <= 365:
+        raise RuntimeError("REVIEW_LOOKBACK_DAYS must be between 1 and 365.")
+
+    stores = configured_stores()
+    total_sent = 0
+    failures = []
+
+    log.info("Starting review processing for %d store(s).", len(stores))
+    for store_name, token in stores:
+        try:
+            total_sent += run_store(store_name, token, lookback_days)
+        except Exception as exc:
+            # Exception text contains status/error details, never request headers.
+            log.error("[%s] Store processing failed: %s", store_name, exc)
+            failures.append(store_name)
+
+    log.info("All stores finished. Total replies sent: %d", total_sent)
+    if failures:
+        raise RuntimeError("Processing failed for store(s): " + ", ".join(failures))
 
 
 if __name__ == "__main__":
