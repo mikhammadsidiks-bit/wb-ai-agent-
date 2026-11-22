@@ -2,16 +2,20 @@ name: WB AutoReply
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: wb-auto-reply
+  cancel-in-progress: false
+
 jobs:
   auto-reply:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,9 +26,9 @@ jobs:
       - name: Install dependencies
         working-directory: auto_reply
         run: pip install -r requirements.txt
-      - name: Reply to new reviews
+      - name: Reply to unanswered reviews
         working-directory: auto_reply
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-          START_DATE: ${{ vars.START_DATE }}
+          REVIEW_LOOKBACK_DAYS: "30"
         run: python main.py
