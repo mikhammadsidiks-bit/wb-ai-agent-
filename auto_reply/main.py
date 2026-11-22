@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -9,39 +9,72 @@ API = "https://feedbacks-api.wildberries.ru"
 POSITIVE = "Спасибо большое за такой приятный отзыв! ❤️ Очень рады, что вы остались довольны качеством товара и нашей работой. Пользуйтесь с удовольствием! Будем рады видеть вас снова 🥰"
 NEGATIVE = "Спасибо за отзыв. Жаль, что впечатление осталось негативным. Напишите, пожалуйста, в поддержку Wildberries — постараемся разобраться в ситуации."
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("wb-autoreply")
+
+
+def request_with_retry(session, method, url, *, max_attempts=5, **kwargs):
+    """Retry temporary API/network failures without logging credentials."""
+    for attempt in range(max_attempts):
+        try:
+            response = session.request(method, url, timeout=30, **kwargs)
+        except requests.RequestException:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(min(2 ** attempt, 30))
+            continue
+
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt == max_attempts - 1:
+                return response
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = max(1, min(int(retry_after), 60))
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 30)
+            time.sleep(delay)
+            continue
+        return response
+    raise RuntimeError("Request retry loop ended unexpectedly")
+
 
 def run():
     token = os.environ.get("WB_API_TOKEN", "").strip()
-    start_date = os.environ.get("START_DATE", "").strip()
     if not token:
-        raise RuntimeError("WB_API_TOKEN is not configured in GitHub Secrets")
-    if not start_date:
-        raise RuntimeError("START_DATE is not configured in GitHub Variables (YYYY-MM-DD)")
+        raise RuntimeError("Add WB_API_TOKEN in GitHub Actions repository secrets.")
 
-    start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    params = {
-        "isAnswered": "false",
-        "take": 100,
-        "skip": 0,
-        "order": "dateAsc",
-        "dateFrom": int(start.timestamp()),
-    }
+    # On every run, check recent unanswered reviews. The window is configurable.
+    lookback_days = int(os.getenv("REVIEW_LOOKBACK_DAYS", "30"))
+    if not 1 <= lookback_days <= 365:
+        raise RuntimeError("REVIEW_LOOKBACK_DAYS must be between 1 and 365.")
+    date_from = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp())
+
     headers = {"Authorization": token, "Accept": "application/json"}
-    sent = 0
     session = requests.Session()
+    sent = 0
 
-    # Each successful reply removes one item from the unanswered list.
-    # Re-read from skip=0 after each batch so pagination cannot skip reviews.
+    # Successful replies disappear from the unanswered list, so keep reading
+    # from skip=0 until no unanswered reviews remain on the first page.
     while sent < 500:
-        response = session.get(
-            f"{API}/api/v1/feedbacks",
-            headers=headers,
-            params=params,
-            timeout=30,
+        params = {
+            "isAnswered": "false",
+            "take": 100,
+            "skip": 0,
+            "order": "dateAsc",
+            "dateFrom": date_from,
+        }
+        response = request_with_retry(
+            session, "GET", f"{API}/api/v1/feedbacks",
+            headers=headers, params=params,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"WB list request failed: HTTP {response.status_code}: {response.text[:500]}")
+            raise RuntimeError(
+                f"WB review-list request failed: HTTP {response.status_code}. "
+                "Check token permissions and WB API availability."
+            )
 
         payload = response.json()
         feedbacks = (payload.get("data") or {}).get("feedbacks") or []
@@ -52,32 +85,38 @@ def run():
         for feedback in feedbacks:
             feedback_id = feedback.get("id")
             rating = feedback.get("productValuation")
-            if not feedback_id or not isinstance(rating, int) or rating < 1 or rating > 5:
-                logging.warning("Skipping review with missing ID or invalid rating")
+            if not feedback_id or not isinstance(rating, int) or not 1 <= rating <= 5:
+                log.warning("Skipped a review with missing ID or invalid rating.")
                 continue
 
-            text = POSITIVE if rating >= 4 else NEGATIVE
-            result = session.post(
+            answer_text = POSITIVE if rating >= 4 else NEGATIVE
+            result = request_with_retry(
+                session,
+                "POST",
                 f"{API}/api/v1/feedbacks/answer",
                 headers={**headers, "Content-Type": "application/json"},
-                json={"id": feedback_id, "text": text},
-                timeout=30,
+                json={"id": feedback_id, "text": answer_text},
             )
             if result.status_code != 204:
-                # Stop on the first failure; never spin on a review that WB did not accept.
                 raise RuntimeError(
-                    f"WB reply failed for review {feedback_id}: "
-                    f"HTTP {result.status_code}: {result.text[:500]}"
+                    f"WB reply request failed: HTTP {result.status_code}. "
+                    "Check token write permissions and WB API availability."
                 )
+
             sent += 1
             batch_sent += 1
-            logging.info("Replied to review %s (%s stars)", feedback_id, rating)
-            time.sleep(0.4)  # Personal token limit: max 3 requests/second.
+            log.info("Successfully replied to a review (%s stars).", rating)
+            time.sleep(0.4)  # Stay below the personal-token request limit.
 
         if batch_sent == 0:
+            log.warning(
+                "No replies were sent from the current page; stopping to avoid "
+                "reprocessing the same unanswered reviews."
+            )
             break
 
-    logging.info("Finished. Replies sent: %d", sent)
+    log.info("Run finished. Replies sent: %d", sent)
+
 
 if __name__ == "__main__":
     run()
