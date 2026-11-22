@@ -33,5 +33,7 @@ jobs:
           WB_STORE_NAME: "Магазин 1"
           WB_API_TOKEN_2: ${{ secrets.WB_API_TOKEN_2 }}
           WB_STORE_NAME_2: "Магазин 2"
+          WB_API_TOKEN_3: ${{ secrets.WB_API_TOKEN_3 }}
+          WB_STORE_NAME_3: "Магазин 3"
           REVIEW_LOOKBACK_DAYS: "100"
         run: python main.py
